@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -13,11 +15,11 @@ use bitcoin::Network;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use traits::Stream;
-use types::{ConnectionType, FutureResult, V1Header};
+use types::{ConnectionType, FutureResult, Nonce, V1Header};
 
 pub const USER_AGENT: &str = "rust-bitcoin-test / 0.1.0";
 pub const DEFAULT_PORT: u16 = 83;
@@ -32,54 +34,85 @@ pub struct Connection {
 
 impl Connection {
     pub async fn outbound(
-        socker_addr: impl Into<SocketAddr>,
-        network: Network,
-    ) -> Result<Self, std::io::Error> {
-        let stream = TcpStream::connect(socker_addr.into()).await?;
-        let v1 = V1Stream::new(stream, network);
-        Ok(Self {
-            stream: Arc::new(v1),
-        })
-    }
-
-    pub async fn outbound_with_version_exchange(
-        socker_addr: impl Into<SocketAddr>,
+        socket_addr: impl Into<SocketAddr>,
         connection_type: ConnectionType,
         network: Network,
     ) -> Result<Self, Box<dyn Error>> {
-        let socker_addr: SocketAddr = socker_addr.into();
-        let stream = TcpStream::connect(socker_addr).await?;
+        let stream = TcpStream::connect(socket_addr.into()).await?;
         let stream: Arc<dyn Stream> = match connection_type {
             ConnectionType::V1 => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("time went backwards")
-                    .as_secs();
-                let ip =
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), socker_addr.port());
-                let from_and_recv = Address::new(&ip, ServiceFlags::NONE);
-                let version = VersionMessage {
-                    version: PROTOCOL_VERSION,
-                    services: ServiceFlags::NONE,
-                    timestamp: now as i64,
-                    receiver: from_and_recv.clone(),
-                    sender: from_and_recv,
-                    nonce: 1,
-                    user_agent: USER_AGENT.to_string(),
-                    start_height: 0,
-                    relay: false,
-                };
                 let v1_stream = V1Stream::new(stream, network);
-                v1_stream
-                    .write_message(NetworkMessage::Version(version))
-                    .await?;
-                let _version = v1_stream.read_message().await?.unwrap();
-                let _verack = v1_stream.read_message().await?.unwrap();
-                v1_stream.write_message(NetworkMessage::Verack).await?;
                 Arc::new(v1_stream)
             }
             ConnectionType::V2 => {
                 let v2_stream = V2Stream::connect_with_handshake(stream, network, Role::Initiator)
+                    .await
+                    .map_err(|e| Box::new(e))?;
+                Arc::new(v2_stream)
+            }
+        };
+        Ok(Self { stream })
+    }
+
+    pub async fn outbound_with_version_exchange(
+        socket_addr: impl Into<SocketAddr>,
+        connection_type: ConnectionType,
+        network: Network,
+    ) -> Result<Self, Box<dyn Error>> {
+        let socket_addr: SocketAddr = socket_addr.into();
+        let stream = TcpStream::connect(socket_addr).await?;
+        let stream: Arc<dyn Stream> = match connection_type {
+            ConnectionType::V1 => {
+                let v1_stream = V1Stream::new(stream, network);
+                Arc::new(v1_stream)
+            }
+            ConnectionType::V2 => {
+                let v2_stream = V2Stream::connect_with_handshake(stream, network, Role::Initiator)
+                    .await
+                    .map_err(|e| Box::new(e))?;
+                Arc::new(v2_stream)
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_secs();
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), socket_addr.port());
+        let from_and_recv = Address::new(&ip, ServiceFlags::NONE);
+        let version = VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: ServiceFlags::NONE,
+            timestamp: now as i64,
+            receiver: from_and_recv.clone(),
+            sender: from_and_recv,
+            nonce: 1,
+            user_agent: USER_AGENT.to_string(),
+            start_height: 0,
+            relay: false,
+        };
+        stream
+            .write_message(NetworkMessage::Version(version))
+            .await?;
+        let _version = stream.read_message().await?.unwrap();
+        let _verack = stream.read_message().await?.unwrap();
+        stream.write_message(NetworkMessage::Verack).await?;
+        Ok(Self { stream })
+    }
+
+    pub async fn inbound(
+        socket_addr: impl Into<SocketAddr>,
+        connection_type: ConnectionType,
+        network: Network,
+    ) -> Result<Self, Box<dyn Error>> {
+        let listen = TcpListener::bind(socket_addr.into()).await?;
+        let (stream, _) = listen.accept().await?;
+        let stream: Arc<dyn Stream> = match connection_type {
+            ConnectionType::V1 => {
+                let v1_stream = V1Stream::new(stream, network);
+                Arc::new(v1_stream)
+            }
+            ConnectionType::V2 => {
+                let v2_stream = V2Stream::connect_with_handshake(stream, network, Role::Responder)
                     .await
                     .map_err(|e| Box::new(e))?;
                 Arc::new(v2_stream)
@@ -94,6 +127,69 @@ impl Connection {
 
     pub async fn read_message(&self) -> Result<Option<NetworkMessage>, Box<dyn Error>> {
         self.stream.read_message().await
+    }
+}
+
+pub struct ConnectionPool {
+    connections: Arc<Mutex<HashMap<Nonce, Connection>>>,
+    count: Nonce,
+    network: Network,
+}
+
+impl ConnectionPool {
+    fn new(network: Network) -> Self {
+        Self {
+            connections: Arc::new(HashMap::new().into()),
+            count: Nonce(0),
+            network,
+        }
+    }
+
+    async fn new_outbound(
+        &self,
+        socket_addr: impl Into<SocketAddr>,
+        connection_type: ConnectionType,
+        version_exchange: bool,
+    ) -> Result<Nonce, Box<dyn Error>> {
+        let conn = if version_exchange {
+            Connection::outbound_with_version_exchange(socket_addr, connection_type, self.network)
+                .await?
+        } else {
+            Connection::outbound(socket_addr, connection_type, self.network).await?
+        };
+        let mut lock = self.connections.lock().await;
+        let nonce = Nonce(self.count.0 + 1);
+        lock.insert(nonce, conn);
+        Ok(nonce)
+    }
+
+    async fn send_all(&self, network_message: NetworkMessage) -> Vec<Nonce> {
+        let mut fails = Vec::new();
+        let lock = self.connections.lock().await;
+        for (nonce, conn) in lock.deref() {
+            let result = conn.write_message(network_message.clone()).await;
+            if result.is_err() {
+                fails.push(*nonce);
+            }
+        }
+        fails
+    }
+
+    async fn send_from(
+        &self,
+        nonce: &Nonce,
+        network_message: NetworkMessage,
+    ) -> Result<(), Box<dyn Error>> {
+        let lock = self.connections.lock().await;
+        if let Some(conn) = lock.get(nonce) {
+            conn.write_message(network_message).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove(&self, nonce: &Nonce) {
+        let mut lock = self.connections.lock().await;
+        lock.remove(nonce);
     }
 }
 

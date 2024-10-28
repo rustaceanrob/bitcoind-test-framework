@@ -8,10 +8,14 @@ use bitcoin::p2p::Magic;
 
 pub(crate) type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
+#[derive(Debug, Clone, Copy)]
 pub enum ConnectionType {
     V1,
     V2,
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, PartialOrd, Hash, Eq, Ord)]
+pub struct Nonce(pub(crate) u32);
 
 pub(crate) struct V1Header {
     pub(crate) magic: Magic,
