@@ -1,0 +1,215 @@
+use std::error::Error;
+use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use bip324::{AsyncProtocol, Role};
+use bitcoin::consensus::{deserialize, deserialize_partial, serialize, Decodable};
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::{message_network::VersionMessage, Address, ServiceFlags};
+use bitcoin::Network;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use traits::Stream;
+use types::{ConnectionType, FutureResult, V1Header};
+
+pub const USER_AGENT: &str = "rust-bitcoin-test / 0.1.0";
+pub const DEFAULT_PORT: u16 = 83;
+pub const PROTOCOL_VERSION: u32 = 70016;
+
+pub mod errors;
+mod traits;
+pub mod types;
+pub struct Connection {
+    stream: Arc<dyn Stream>,
+}
+
+impl Connection {
+    pub async fn outbound(
+        socker_addr: impl Into<SocketAddr>,
+        network: Network,
+    ) -> Result<Self, std::io::Error> {
+        let stream = TcpStream::connect(socker_addr.into()).await?;
+        let v1 = V1Stream::new(stream, network);
+        Ok(Self {
+            stream: Arc::new(v1),
+        })
+    }
+
+    pub async fn outbound_with_version_exchange(
+        socker_addr: impl Into<SocketAddr>,
+        connection_type: ConnectionType,
+        network: Network,
+    ) -> Result<Self, Box<dyn Error>> {
+        let socker_addr: SocketAddr = socker_addr.into();
+        let stream = TcpStream::connect(socker_addr).await?;
+        let stream: Arc<dyn Stream> = match connection_type {
+            ConnectionType::V1 => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("time went backwards")
+                    .as_secs();
+                let ip =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), socker_addr.port());
+                let from_and_recv = Address::new(&ip, ServiceFlags::NONE);
+                let version = VersionMessage {
+                    version: PROTOCOL_VERSION,
+                    services: ServiceFlags::NONE,
+                    timestamp: now as i64,
+                    receiver: from_and_recv.clone(),
+                    sender: from_and_recv,
+                    nonce: 1,
+                    user_agent: USER_AGENT.to_string(),
+                    start_height: 0,
+                    relay: false,
+                };
+                let v1_stream = V1Stream::new(stream, network);
+                v1_stream
+                    .write_message(NetworkMessage::Version(version))
+                    .await?;
+                let _version = v1_stream.read_message().await?.unwrap();
+                let _verack = v1_stream.read_message().await?.unwrap();
+                v1_stream.write_message(NetworkMessage::Verack).await?;
+                Arc::new(v1_stream)
+            }
+            ConnectionType::V2 => {
+                let v2_stream = V2Stream::connect_with_handshake(stream, network, Role::Initiator)
+                    .await
+                    .map_err(|e| Box::new(e))?;
+                Arc::new(v2_stream)
+            }
+        };
+        Ok(Self { stream })
+    }
+
+    pub async fn write_message(&self, message: NetworkMessage) -> Result<(), Box<dyn Error>> {
+        self.stream.write_message(message).await
+    }
+
+    pub async fn read_message(&self) -> Result<Option<NetworkMessage>, Box<dyn Error>> {
+        self.stream.read_message().await
+    }
+}
+
+struct V1Stream {
+    stream: Arc<Mutex<TcpStream>>,
+    network: Network,
+}
+
+impl V1Stream {
+    fn new(stream: TcpStream, network: Network) -> Self {
+        Self {
+            stream: Arc::new(stream.into()),
+            network,
+        }
+    }
+
+    async fn _read_message(&self) -> Result<Option<NetworkMessage>, Box<dyn Error>> {
+        let mut stream = self.stream.lock().await;
+        let mut message_buf = vec![0_u8; 24];
+        let _ = stream
+            .read_exact(&mut message_buf)
+            .await
+            .map_err(|e| Box::new(e))?;
+        let header: V1Header = deserialize_partial(&message_buf)
+            .map_err(|e| Box::new(e))?
+            .0;
+        let mut contents_buf = vec![0_u8; header.length as usize];
+        let _ = stream
+            .read_exact(&mut contents_buf)
+            .await
+            .map_err(|e| Box::new(e))?;
+        match header.command.as_ref() {
+            "block" => {
+                let mut buf = contents_buf.as_slice();
+                Ok(Some(NetworkMessage::Block(
+                    Decodable::consensus_decode(&mut buf).map_err(|e| Box::new(e))?,
+                )))
+            }
+            _ => {
+                message_buf.extend_from_slice(&contents_buf);
+                let message: RawNetworkMessage =
+                    deserialize(&message_buf).map_err(|e| Box::new(e))?;
+                Ok(Some(message.payload().clone()))
+            }
+        }
+    }
+
+    async fn _write_message(&self, message: NetworkMessage) -> Result<(), Box<dyn Error>> {
+        let mut lock = self.stream.lock().await;
+        let raw_net_msg = RawNetworkMessage::new(self.network.magic(), message);
+        let bytes = serialize(&raw_net_msg);
+        lock.write_all(&bytes).await.map_err(|e| Box::new(e))?;
+        lock.flush().await.map_err(|e| Box::new(e))?;
+        Ok(())
+    }
+}
+
+impl Stream for V1Stream {
+    fn write_message(&self, message: NetworkMessage) -> FutureResult<(), Box<dyn Error>> {
+        Box::pin(self._write_message(message))
+    }
+
+    fn read_message(&self) -> FutureResult<Option<NetworkMessage>, Box<dyn Error>> {
+        Box::pin(self._read_message())
+    }
+}
+
+struct V2Stream {
+    proto: Arc<Mutex<AsyncProtocol<Compat<OwnedReadHalf>, Compat<OwnedWriteHalf>>>>,
+}
+
+impl V2Stream {
+    async fn connect_with_handshake(
+        stream: TcpStream,
+        network: Network,
+        role: Role,
+    ) -> Result<Self, bip324::ProtocolError> {
+        let (reader, writer) = stream.into_split();
+        let proto = AsyncProtocol::new(
+            network,
+            role,
+            None,
+            None,
+            reader.compat(),
+            writer.compat_write(),
+        )
+        .await?;
+        Ok(Self {
+            proto: Arc::new(proto.into()),
+        })
+    }
+
+    async fn _read_message(&self) -> Result<Option<NetworkMessage>, Box<dyn Error>> {
+        let mut lock = self.proto.lock().await;
+        let payload = lock.reader().decrypt().await.map_err(|e| Box::new(e))?;
+        let message = bip324::serde::deserialize(payload.contents()).map_err(|e| Box::new(e))?;
+        Ok(Some(message))
+    }
+
+    async fn _write_message(&self, message: NetworkMessage) -> Result<(), Box<dyn Error>> {
+        let mut lock = self.proto.lock().await;
+        let encoding = bip324::serde::serialize(message).map_err(|e| Box::new(e))?;
+        lock.writer()
+            .encrypt(&encoding)
+            .await
+            .map_err(|e| Box::new(e))?;
+        Ok(())
+    }
+}
+
+impl Stream for V2Stream {
+    fn write_message(&self, message: NetworkMessage) -> FutureResult<(), Box<dyn Error>> {
+        Box::pin(self._write_message(message))
+    }
+
+    fn read_message(&self) -> FutureResult<Option<NetworkMessage>, Box<dyn Error>> {
+        Box::pin(self._read_message())
+    }
+}
