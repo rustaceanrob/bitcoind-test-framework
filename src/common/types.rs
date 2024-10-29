@@ -15,8 +15,25 @@ pub enum ConnectionType {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, PartialOrd, Hash, Eq, Ord)]
-pub struct Nonce(pub(crate) u32);
+pub struct Nonce(pub u32);
 
+impl Nonce {
+    pub(crate) fn add(&mut self) {
+        self.0 = self.0 + 1;
+    }
+}
+
+impl std::ops::Add for Nonce {
+    type Output = Nonce;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Nonce(self.0 + rhs.0)
+    }
+}
+
+pub struct SendMessageFailures(pub Vec<Nonce>);
+
+#[allow(unused)]
 pub(crate) struct V1Header {
     pub(crate) magic: Magic,
     pub(crate) command: CommandString,

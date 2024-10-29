@@ -19,15 +19,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use traits::Stream;
-use types::{ConnectionType, FutureResult, Nonce, V1Header};
+use types::{ConnectionType, FutureResult, Nonce, SendMessageFailures, V1Header};
 
 pub const USER_AGENT: &str = "rust-bitcoin-test / 0.1.0";
-pub const DEFAULT_PORT: u16 = 83;
+pub const DEFAULT_P2P_PORT: u16 = 18444;
 pub const PROTOCOL_VERSION: u32 = 70016;
 
 pub mod errors;
 mod traits;
 pub mod types;
+
+#[derive(Clone)]
 pub struct Connection {
     stream: Arc<dyn Stream>,
 }
@@ -58,6 +60,7 @@ impl Connection {
         socket_addr: impl Into<SocketAddr>,
         connection_type: ConnectionType,
         network: Network,
+        services_offered: ServiceFlags,
     ) -> Result<Self, Box<dyn Error>> {
         let socket_addr: SocketAddr = socket_addr.into();
         let stream = TcpStream::connect(socket_addr).await?;
@@ -78,10 +81,10 @@ impl Connection {
             .expect("time went backwards")
             .as_secs();
         let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), socket_addr.port());
-        let from_and_recv = Address::new(&ip, ServiceFlags::NONE);
+        let from_and_recv = Address::new(&ip, services_offered);
         let version = VersionMessage {
             version: PROTOCOL_VERSION,
-            services: ServiceFlags::NONE,
+            services: services_offered,
             timestamp: now as i64,
             receiver: from_and_recv.clone(),
             sender: from_and_recv,
@@ -93,9 +96,37 @@ impl Connection {
         stream
             .write_message(NetworkMessage::Version(version))
             .await?;
-        let _version = stream.read_message().await?.unwrap();
-        let _verack = stream.read_message().await?.unwrap();
-        stream.write_message(NetworkMessage::Verack).await?;
+
+        let version = stream
+            .read_message()
+            .await?
+            .ok_or(Box::new(std::io::Error::other(
+                "version message not received.",
+            )))?;
+
+        if !matches!(version, NetworkMessage::Version(_)) {
+            return Err(Box::new(std::io::Error::other(
+                "version message not received as response to version sent",
+            )));
+        }
+
+        loop {
+            let message = stream.read_message().await?;
+            if let Some(message) = message {
+                if matches!(
+                    message,
+                    NetworkMessage::SendAddrV2
+                        | NetworkMessage::SendCmpct(_)
+                        | NetworkMessage::SendHeaders
+                ) {
+                    continue;
+                }
+                if matches!(message, NetworkMessage::Verack) {
+                    stream.write_message(NetworkMessage::Verack).await?;
+                    break;
+                }
+            }
+        }
         Ok(Self { stream })
     }
 
@@ -132,38 +163,45 @@ impl Connection {
 
 pub struct ConnectionPool {
     connections: Arc<Mutex<HashMap<Nonce, Connection>>>,
-    count: Nonce,
+    count: Arc<Mutex<Nonce>>,
     network: Network,
 }
 
 impl ConnectionPool {
-    fn new(network: Network) -> Self {
+    pub fn new(network: Network) -> Self {
         Self {
             connections: Arc::new(HashMap::new().into()),
-            count: Nonce(0),
+            count: Arc::new(Nonce(0).into()),
             network,
         }
     }
 
-    async fn new_outbound(
+    pub async fn new_outbound(
         &self,
         socket_addr: impl Into<SocketAddr>,
         connection_type: ConnectionType,
+        services_offered: ServiceFlags,
         version_exchange: bool,
     ) -> Result<Nonce, Box<dyn Error>> {
         let conn = if version_exchange {
-            Connection::outbound_with_version_exchange(socket_addr, connection_type, self.network)
-                .await?
+            Connection::outbound_with_version_exchange(
+                socket_addr,
+                connection_type,
+                self.network,
+                services_offered,
+            )
+            .await?
         } else {
             Connection::outbound(socket_addr, connection_type, self.network).await?
         };
         let mut lock = self.connections.lock().await;
-        let nonce = Nonce(self.count.0 + 1);
-        lock.insert(nonce, conn);
-        Ok(nonce)
+        let mut count_lock = self.count.lock().await;
+        count_lock.add();
+        lock.insert(*count_lock, conn);
+        Ok(*count_lock)
     }
 
-    async fn send_all(&self, network_message: NetworkMessage) -> Vec<Nonce> {
+    pub async fn send_all(&self, network_message: NetworkMessage) -> SendMessageFailures {
         let mut fails = Vec::new();
         let lock = self.connections.lock().await;
         for (nonce, conn) in lock.deref() {
@@ -172,10 +210,10 @@ impl ConnectionPool {
                 fails.push(*nonce);
             }
         }
-        fails
+        SendMessageFailures(fails)
     }
 
-    async fn send_from(
+    pub async fn send_from(
         &self,
         nonce: &Nonce,
         network_message: NetworkMessage,
@@ -187,12 +225,22 @@ impl ConnectionPool {
         Ok(())
     }
 
-    async fn remove(&self, nonce: &Nonce) {
+    pub async fn remove(&self, nonce: &Nonce) {
         let mut lock = self.connections.lock().await;
         lock.remove(nonce);
     }
+
+    pub async fn read_from(&self, nonce: &Nonce) -> Result<Option<NetworkMessage>, Box<dyn Error>> {
+        let lock = self.connections.lock().await;
+        if let Some(conn) = lock.get(nonce) {
+            let msg = conn.read_message().await?;
+            return Ok(msg);
+        }
+        Ok(None)
+    }
 }
 
+#[derive(Debug)]
 struct V1Stream {
     stream: Arc<Mutex<TcpStream>>,
     network: Network,
