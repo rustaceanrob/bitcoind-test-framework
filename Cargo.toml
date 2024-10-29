@@ -25,3 +25,7 @@ tokio-util = { version = "0.7.12", features = ["compat"] }
 [lib]
 name = "bitcoind_test_framework"
 path = "src/lib.rs"
+
+[[example]]
+name = "hopeulikeaddrs"
+path = "scenarios/hopeulikeaddrs.rs"

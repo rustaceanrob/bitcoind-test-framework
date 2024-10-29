@@ -209,6 +209,9 @@ impl ConnectionPool {
             if result.is_err() {
                 fails.push(*nonce);
             }
+            if result.is_ok() {
+                println!("Sent to {nonce:?}");
+            }
         }
         SendMessageFailures(fails)
     }
